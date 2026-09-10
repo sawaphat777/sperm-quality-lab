@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 
@@ -28,6 +28,8 @@ _YOLO_MODEL: Any | None = None
 _YOLO_MODEL_LOAD_FAILED = False
 _ANALYSIS_JOBS: dict[str, dict[str, Any]] = {}
 _ANALYSIS_JOB_LOCK = threading.Lock()
+_TRACKING_JOBS: dict[str, dict[str, Any]] = {}
+_TRACKING_JOB_LOCK = threading.Lock()
 DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.onnx"
 
 
@@ -52,6 +54,10 @@ class VideoUrlRequest(BaseModel):
     video_url: str
     microns_per_pixel: float = 0.5
     min_track_length: int = 8
+
+
+class TrackingJobRequest(VideoUrlRequest):
+    max_frames: int = 120
 
 
 @dataclass
@@ -199,6 +205,39 @@ def run_analysis_job(job_id: str, payload: VideoUrlRequest) -> None:
     except Exception as error:
         detail = error.detail if isinstance(error, HTTPException) else str(error)
         update_analysis_job(job_id, status="failed", error=str(detail), updated_at=time.time())
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def update_tracking_job(job_id: str, **values: Any) -> None:
+    with _TRACKING_JOB_LOCK:
+        if job_id in _TRACKING_JOBS:
+            _TRACKING_JOBS[job_id].update(values)
+
+
+def run_tracking_job(job_id: str, payload: TrackingJobRequest) -> None:
+    temp_path: Path | None = None
+    update_tracking_job(job_id, status="processing", updated_at=time.time())
+    try:
+        temp_path = download_signed_video(payload.video_url)
+        result = collect_tracking_frames(
+            temp_path,
+            payload.microns_per_pixel,
+            payload.min_track_length,
+            payload.max_frames,
+        )
+        frames = result.pop("frames")
+        update_tracking_job(
+            job_id,
+            status="completed",
+            frames=frames,
+            result=result,
+            updated_at=time.time(),
+        )
+    except Exception as error:
+        detail = error.detail if isinstance(error, HTTPException) else str(error)
+        update_tracking_job(job_id, status="failed", error=str(detail), updated_at=time.time())
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -957,6 +996,67 @@ def get_analysis_job(
         if job is None:
             raise HTTPException(status_code=404, detail="Analysis job was not found or the service restarted")
         return {"job_id": job_id, **job}
+
+
+@app.post("/tracking-jobs")
+def create_tracking_job(
+    payload: TrackingJobRequest,
+    background_tasks: BackgroundTasks,
+    x_ai_service_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    verify_service_token(x_ai_service_token)
+    payload.max_frames = min(max(payload.max_frames, 1), 180)
+    job_id = uuid.uuid4().hex
+    with _TRACKING_JOB_LOCK:
+        if len(_TRACKING_JOBS) >= 10:
+            oldest_job_id = min(_TRACKING_JOBS, key=lambda item: _TRACKING_JOBS[item]["created_at"])
+            _TRACKING_JOBS.pop(oldest_job_id, None)
+        _TRACKING_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    background_tasks.add_task(run_tracking_job, job_id, payload)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/tracking-jobs/{job_id}")
+def get_tracking_job(
+    job_id: str,
+    x_ai_service_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_service_token(x_ai_service_token)
+    with _TRACKING_JOB_LOCK:
+        job = _TRACKING_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Tracking job was not found or the service restarted")
+        response = {key: value for key, value in job.items() if key != "frames"}
+        return {"job_id": job_id, **response}
+
+
+@app.get("/tracking-jobs/{job_id}/frames/{frame_index}")
+def get_tracking_job_frame(
+    job_id: str,
+    frame_index: int,
+    x_ai_service_token: str | None = Header(default=None),
+) -> Response:
+    verify_service_token(x_ai_service_token)
+    with _TRACKING_JOB_LOCK:
+        job = _TRACKING_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Tracking job was not found or the service restarted")
+        if job.get("status") != "completed":
+            raise HTTPException(status_code=409, detail="Tracking job is not complete")
+        frames = job.get("frames", [])
+        if frame_index < 0 or frame_index >= len(frames):
+            raise HTTPException(status_code=404, detail="Tracking frame was not found")
+        encoded_frame = frames[frame_index]
+
+    return Response(
+        content=base64.b64decode(encoded_frame),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @app.post("/visualize")

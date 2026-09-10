@@ -7,9 +7,9 @@ import { useRouter } from "next/navigation";
 import { createBrowserSupabase } from "@/lib/supabase";
 
 type TrackingFrames = {
+  jobId: string;
   fps: number;
   frame_count: number;
-  frames: string[];
   metrics: {
     tracked_sperm_count: number;
     progressive_motility_percent: number;
@@ -62,10 +62,10 @@ export default function TrackingStudioPage() {
   }, [processing]);
 
   useEffect(() => {
-    if (!playing || !trackingFrames?.frames.length) return;
+    if (!playing || !trackingFrames?.frame_count) return;
     const frameDelay = Math.max(40, Math.round(1000 / Math.min(trackingFrames.fps || 12, 24)));
     const timer = window.setInterval(() => {
-      setCurrentFrame((frame) => (frame + 1) % trackingFrames.frames.length);
+      setCurrentFrame((frame) => (frame + 1) % trackingFrames.frame_count);
     }, frameDelay);
     return () => window.clearInterval(timer);
   }, [playing, trackingFrames]);
@@ -80,29 +80,81 @@ export default function TrackingStudioPage() {
     setTrackingFrames(null);
     setCurrentFrame(0);
 
-    const formData = new FormData();
-    formData.append("video", video);
-    formData.append("microns_per_pixel", microns);
-    formData.append("min_track_length", minTrackLength);
-    formData.append("max_frames", "240");
-
     try {
-      const response = await fetch("/api/visualize-frames", {
-        method: "POST",
-        body: formData
-      });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({ error: "Tracking visualization failed" }));
-        setError(data.error || "Tracking visualization failed");
+      const {
+        data: { user }
+      } = await supabase.auth.getUser();
+      if (!user) {
+        setError("Your session expired. Please log in again.");
         return;
       }
 
-      const data = (await response.json()) as TrackingFrames;
-      setTrackingFrames(data);
-      setPlaying(true);
-    } catch {
-      setError("Could not reach the tracking service. Please make sure the AI service is running and try again.");
+      const safeName = video.name.replace(/[^a-zA-Z0-9._-]/g, "-");
+      const videoPath = `${user.id}/tracking-${Date.now()}-${safeName}`;
+      const { error: uploadError } = await supabase.storage.from("lab-videos").upload(videoPath, video, {
+        upsert: false,
+        contentType: video.type || "video/mp4"
+      });
+      if (uploadError) {
+        setError(`Video upload failed: ${uploadError.message}`);
+        return;
+      }
+
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from("lab-videos")
+        .createSignedUrl(videoPath, 60 * 60);
+      if (signedError || !signedData?.signedUrl) {
+        setError(`Could not prepare tracking video: ${signedError?.message || "Missing signed URL"}`);
+        return;
+      }
+
+      const response = await fetch("/api/tracking-jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          videoUrl: signedData.signedUrl,
+          micronsPerPixel: Number(microns),
+          minTrackLength: Number(minTrackLength),
+          maxFrames: 120
+        })
+      });
+      const startData = await response.json().catch(() => ({ error: "Could not start tracking" }));
+      if (!response.ok || !startData.jobId) {
+        setError(startData.error || "Could not start tracking");
+        return;
+      }
+
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2500));
+        const statusResponse = await fetch(`/api/tracking-jobs/${encodeURIComponent(startData.jobId)}`, {
+          cache: "no-store"
+        });
+        const statusData = await statusResponse.json().catch(() => ({ error: "Could not read tracking status" }));
+        if (!statusResponse.ok) {
+          setError(statusData.error || "Could not read tracking status");
+          return;
+        }
+        if (statusData.status === "failed") {
+          setError(statusData.error || "Tracking visualization failed");
+          return;
+        }
+        if (statusData.status === "completed") {
+          setTrackingFrames({
+            jobId: startData.jobId,
+            fps: statusData.fps,
+            frame_count: statusData.frame_count,
+            metrics: statusData.metrics,
+            mode: statusData.mode
+          });
+          setPlaying(true);
+          return;
+        }
+      }
+      setError("Tracking exceeded 15 minutes. Try a shorter video or a smaller frame size.");
+    } catch (trackingError) {
+      const message = trackingError instanceof Error ? trackingError.message : "Unknown browser error";
+      setError(`Tracking request failed: ${message}`);
     } finally {
       setProcessing(false);
     }
@@ -199,18 +251,18 @@ export default function TrackingStudioPage() {
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 className="tracking-video"
-                src={`data:image/jpeg;base64,${trackingFrames.frames[currentFrame]}`}
+                src={`/api/tracking-jobs/${encodeURIComponent(trackingFrames.jobId)}/frames/${currentFrame}`}
                 alt="AI tracking overlay frame"
               />
               <div className="frame-controls">
                 <span className="muted">
-                  Frame {currentFrame + 1} / {trackingFrames.frames.length}
+                  Frame {currentFrame + 1} / {trackingFrames.frame_count}
                 </span>
                 <input
                   className="frame-slider"
                   type="range"
                   min="0"
-                  max={Math.max(0, trackingFrames.frames.length - 1)}
+                  max={Math.max(0, trackingFrames.frame_count - 1)}
                   value={currentFrame}
                   onChange={(event) => {
                     setPlaying(false);
