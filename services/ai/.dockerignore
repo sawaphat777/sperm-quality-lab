@@ -3,3 +3,4 @@ __pycache__
 training
 detector_eval.py
 start-yolo-service.ps1
+models/*.pt

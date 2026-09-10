@@ -5,10 +5,12 @@ import hmac
 import math
 import os
 import tempfile
+import urllib.request
 from starlette.background import BackgroundTask
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -21,7 +23,7 @@ app = FastAPI(title="Sperm Quality AI Service")
 
 _YOLO_MODEL: Any | None = None
 _YOLO_MODEL_LOAD_FAILED = False
-DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.pt"
+DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.onnx"
 
 
 class AnalysisResult(BaseModel):
@@ -39,6 +41,12 @@ class AnalysisResult(BaseModel):
     average_straightness: float | None
     confidence: float
     notes: list[str]
+
+
+class VideoUrlRequest(BaseModel):
+    video_url: str
+    microns_per_pixel: float = 0.5
+    min_track_length: int = 8
 
 
 @dataclass
@@ -138,6 +146,33 @@ def verify_service_token(x_ai_service_token: str | None = Header(default=None)) 
         raise HTTPException(status_code=401, detail="Unauthorized AI service request")
 
 
+def download_signed_video(video_url: str) -> Path:
+    parsed = urlparse(video_url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname.endswith(".supabase.co"):
+        raise HTTPException(status_code=400, detail="Only signed Supabase video URLs are accepted")
+
+    suffix = Path(parsed.path).suffix or ".mp4"
+    request = urllib.request.Request(video_url, headers={"User-Agent": "SpermQualityAI/1.0"})
+    downloaded = 0
+    max_bytes = 250 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response, tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        ) as temp:
+            while chunk := response.read(1024 * 1024):
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise HTTPException(status_code=413, detail="Video exceeds the 250 MB limit")
+                temp.write(chunk)
+            return Path(temp.name)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Could not download signed video: {error}") from error
+
+
 def get_yolo_model() -> Any | None:
     global _YOLO_MODEL, _YOLO_MODEL_LOAD_FAILED
     if _YOLO_MODEL is not None:
@@ -151,9 +186,12 @@ def get_yolo_model() -> Any | None:
         return None
 
     try:
-        from ultralytics import YOLO
+        if model_path.suffix.lower() == ".onnx":
+            _YOLO_MODEL = cv2.dnn.readNetFromONNX(str(model_path))
+        else:
+            from ultralytics import YOLO
 
-        _YOLO_MODEL = YOLO(str(model_path))
+            _YOLO_MODEL = YOLO(str(model_path))
         return _YOLO_MODEL
     except Exception:
         _YOLO_MODEL_LOAD_FAILED = True
@@ -167,10 +205,65 @@ def detector_backend_name() -> str:
     return "classical image detector"
 
 
+def detect_cells_onnx(
+    frame: np.ndarray,
+    model: Any,
+    confidence: float,
+    input_size: int = 640,
+) -> list[tuple[float, float]]:
+    height, width = frame.shape[:2]
+    scale = min(input_size / width, input_size / height)
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(frame, (resized_width, resized_height))
+    pad_x = (input_size - resized_width) // 2
+    pad_y = (input_size - resized_height) // 2
+    canvas = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    canvas[pad_y:pad_y + resized_height, pad_x:pad_x + resized_width] = resized
+
+    blob = cv2.dnn.blobFromImage(canvas, scalefactor=1 / 255.0, size=(input_size, input_size), swapRB=True)
+    model.setInput(blob)
+    predictions = np.squeeze(model.forward())
+    if predictions.ndim != 2:
+        return []
+    if predictions.shape[0] < predictions.shape[1]:
+        predictions = predictions.T
+
+    boxes: list[list[int]] = []
+    scores: list[float] = []
+    centers: list[tuple[float, float]] = []
+    for prediction in predictions:
+        class_scores = prediction[4:]
+        if class_scores.size == 0:
+            continue
+        score = float(np.max(class_scores))
+        if score < confidence:
+            continue
+
+        center_x, center_y, box_width, box_height = [float(value) for value in prediction[:4]]
+        x = int(round(center_x - box_width / 2))
+        y = int(round(center_y - box_height / 2))
+        boxes.append([x, y, int(round(box_width)), int(round(box_height))])
+        scores.append(score)
+
+    selected = cv2.dnn.NMSBoxes(boxes, scores, confidence, 0.35)
+    for index in np.array(selected).reshape(-1) if len(selected) else []:
+        x, y, box_width, box_height = boxes[int(index)]
+        center_x = ((x + box_width / 2) - pad_x) / scale
+        center_y = ((y + box_height / 2) - pad_y) / scale
+        if 0 <= center_x < width and 0 <= center_y < height:
+            centers.append((center_x, center_y))
+    return centers
+
+
 def detect_cells_yolo(frame: np.ndarray, confidence: float = 0.18) -> list[tuple[float, float]]:
     model = get_yolo_model()
     if model is None:
         return []
+
+    model_path = yolo_model_path()
+    if model_path is not None and model_path.suffix.lower() == ".onnx":
+        return detect_cells_onnx(frame, model, confidence)
 
     results = model.predict(frame, imgsz=640, conf=confidence, iou=0.35, max_det=700, verbose=False, device="cpu")
     centers: list[tuple[float, float]] = []
@@ -782,6 +875,20 @@ async def analyze(
 
     try:
         result = analyze_video(temp_path, microns_per_pixel, min_track_length)
+        return result.model_dump()
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@app.post("/analyze-url")
+def analyze_url(
+    payload: VideoUrlRequest,
+    x_ai_service_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_service_token(x_ai_service_token)
+    temp_path = download_signed_video(payload.video_url)
+    try:
+        result = analyze_video(temp_path, payload.microns_per_pixel, payload.min_track_length)
         return result.model_dump()
     finally:
         temp_path.unlink(missing_ok=True)

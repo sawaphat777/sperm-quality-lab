@@ -48,7 +48,7 @@ git push -u origin main
 ใน Supabase > Authentication > URL Configuration:
 
 1. Site URL: ใส่ URL Vercel ของคุณ.
-2. Redirect URLs: เพิ่ม `https://YOUR-VERCEL-URL/auth/callback`, `https://YOUR-VERCEL-URL/reset-password`, และ `https://YOUR-VERCEL-URL/set-password`.
+2. Redirect URLs: เพิ่ม `https://YOUR-VERCEL-URL/home`, `https://YOUR-VERCEL-URL/reset-password`, และ `https://YOUR-VERCEL-URL/set-password`.
 
 Google OAuth ยังใช้ callback ของ Supabase เดิม: `https://dekuysomtzbsathjiids.supabase.co/auth/v1/callback`.
 

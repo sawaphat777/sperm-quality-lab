@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV SPERM_YOLO_MODEL=/app/models/sperm-detector-v1.pt
+ENV SPERM_YOLO_MODEL=/app/models/sperm-detector-v1.onnx
 
 WORKDIR /app
 

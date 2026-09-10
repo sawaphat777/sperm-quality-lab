@@ -30,6 +30,7 @@ export default function LabPage() {
   const [processing, setProcessing] = useState(false);
   const [dots, setDots] = useState(".");
   const [result, setResult] = useState<AiResponse | null>(null);
+  const [analyzedVideoPath, setAnalyzedVideoPath] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -109,6 +110,7 @@ export default function LabPage() {
     setError("");
     setMessage("");
     setResult(null);
+    setAnalyzedVideoPath(null);
 
     const { data: existingOrder, error: orderLookupError } = await supabase
       .from("orders")
@@ -127,13 +129,45 @@ export default function LabPage() {
     }
 
     setProcessing(true);
+    const {
+      data: { user }
+    } = await supabase.auth.getUser();
+    if (!user) {
+      setProcessing(false);
+      setError("Your session expired. Please log in again.");
+      return;
+    }
 
-    const formData = new FormData();
-    formData.append("video", video);
-    formData.append("microns_per_pixel", microns);
-    formData.append("min_track_length", "8");
+    const safeName = video.name.replace(/[^a-zA-Z0-9._-]/g, "-");
+    const videoPath = `${user.id}/${Date.now()}-${safeName}`;
+    const { error: uploadError } = await supabase.storage.from("lab-videos").upload(videoPath, video, {
+      upsert: false,
+      contentType: video.type || "video/mp4"
+    });
+    if (uploadError) {
+      setProcessing(false);
+      setError(`Video upload failed: ${uploadError.message}`);
+      return;
+    }
 
-    const response = await fetch("/api/analyze", { method: "POST", body: formData });
+    const { data: signedData, error: signedError } = await supabase.storage
+      .from("lab-videos")
+      .createSignedUrl(videoPath, 60 * 60);
+    if (signedError || !signedData?.signedUrl) {
+      setProcessing(false);
+      setError(`Could not prepare video for analysis: ${signedError?.message || "Missing signed URL"}`);
+      return;
+    }
+
+    const response = await fetch("/api/analyze-url", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        videoUrl: signedData.signedUrl,
+        micronsPerPixel: Number(microns),
+        minTrackLength: 8
+      })
+    });
     setProcessing(false);
 
     if (!response.ok) {
@@ -143,6 +177,7 @@ export default function LabPage() {
     }
 
     setResult(await response.json());
+    setAnalyzedVideoPath(videoPath);
   }
 
   async function publish() {
@@ -151,7 +186,7 @@ export default function LabPage() {
     setMessage("");
     const { error: publishError } = await supabase.rpc("publish_lab_result", {
       p_sperm_code: code,
-      p_video_url: null,
+      p_video_url: analyzedVideoPath,
       p_metrics: result.metrics,
       p_clinical_band: result.band,
       p_recommendation: result.recommendation,
