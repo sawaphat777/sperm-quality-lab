@@ -5,7 +5,10 @@ import hmac
 import math
 import os
 import tempfile
+import threading
+import time
 import urllib.request
+import uuid
 from starlette.background import BackgroundTask
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,7 +17,7 @@ from urllib.parse import urlparse
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -23,6 +26,8 @@ app = FastAPI(title="Sperm Quality AI Service")
 
 _YOLO_MODEL: Any | None = None
 _YOLO_MODEL_LOAD_FAILED = False
+_ANALYSIS_JOBS: dict[str, dict[str, Any]] = {}
+_ANALYSIS_JOB_LOCK = threading.Lock()
 DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.onnx"
 
 
@@ -171,6 +176,32 @@ def download_signed_video(video_url: str) -> Path:
         raise
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Could not download signed video: {error}") from error
+
+
+def update_analysis_job(job_id: str, **values: Any) -> None:
+    with _ANALYSIS_JOB_LOCK:
+        if job_id in _ANALYSIS_JOBS:
+            _ANALYSIS_JOBS[job_id].update(values)
+
+
+def run_analysis_job(job_id: str, payload: VideoUrlRequest) -> None:
+    temp_path: Path | None = None
+    update_analysis_job(job_id, status="processing", updated_at=time.time())
+    try:
+        temp_path = download_signed_video(payload.video_url)
+        result = analyze_video(temp_path, payload.microns_per_pixel, payload.min_track_length)
+        update_analysis_job(
+            job_id,
+            status="completed",
+            result=result.model_dump(),
+            updated_at=time.time(),
+        )
+    except Exception as error:
+        detail = error.detail if isinstance(error, HTTPException) else str(error)
+        update_analysis_job(job_id, status="failed", error=str(detail), updated_at=time.time())
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def get_yolo_model() -> Any | None:
@@ -892,6 +923,40 @@ def analyze_url(
         return result.model_dump()
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+@app.post("/analysis-jobs")
+def create_analysis_job(
+    payload: VideoUrlRequest,
+    background_tasks: BackgroundTasks,
+    x_ai_service_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    verify_service_token(x_ai_service_token)
+    job_id = uuid.uuid4().hex
+    with _ANALYSIS_JOB_LOCK:
+        if len(_ANALYSIS_JOBS) >= 100:
+            oldest_job_id = min(_ANALYSIS_JOBS, key=lambda item: _ANALYSIS_JOBS[item]["created_at"])
+            _ANALYSIS_JOBS.pop(oldest_job_id, None)
+        _ANALYSIS_JOBS[job_id] = {
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+    background_tasks.add_task(run_analysis_job, job_id, payload)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/analysis-jobs/{job_id}")
+def get_analysis_job(
+    job_id: str,
+    x_ai_service_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_service_token(x_ai_service_token)
+    with _ANALYSIS_JOB_LOCK:
+        job = _ANALYSIS_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Analysis job was not found or the service restarted")
+        return {"job_id": job_id, **job}
 
 
 @app.post("/visualize")

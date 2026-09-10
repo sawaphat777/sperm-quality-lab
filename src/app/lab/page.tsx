@@ -159,25 +159,50 @@ export default function LabPage() {
       return;
     }
 
-    const response = await fetch("/api/analyze-url", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        videoUrl: signedData.signedUrl,
-        micronsPerPixel: Number(microns),
-        minTrackLength: 8
-      })
-    });
-    setProcessing(false);
+    try {
+      const startResponse = await fetch("/api/analysis-jobs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          videoUrl: signedData.signedUrl,
+          micronsPerPixel: Number(microns),
+          minTrackLength: 8
+        })
+      });
+      const startData = await startResponse.json().catch(() => ({ error: "Could not start analysis" }));
+      if (!startResponse.ok || !startData.jobId) {
+        setError(startData.error || "Could not start analysis");
+        return;
+      }
 
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({ error: "Analysis failed" }));
-      setError(data.error || "Analysis failed");
-      return;
+      const deadline = Date.now() + 15 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2500));
+        const statusResponse = await fetch(`/api/analysis-jobs/${encodeURIComponent(startData.jobId)}`, {
+          cache: "no-store"
+        });
+        const statusData = await statusResponse.json().catch(() => ({ error: "Could not read analysis status" }));
+        if (!statusResponse.ok) {
+          setError(statusData.error || "Could not read analysis status");
+          return;
+        }
+        if (statusData.status === "failed") {
+          setError(statusData.error || "AI analysis failed");
+          return;
+        }
+        if (statusData.status === "completed" && statusData.result) {
+          setResult(statusData.result as AiResponse);
+          setAnalyzedVideoPath(videoPath);
+          return;
+        }
+      }
+      setError("Analysis exceeded 15 minutes. Try a shorter video or a smaller frame size.");
+    } catch (analysisError) {
+      const message = analysisError instanceof Error ? analysisError.message : "Unknown browser error";
+      setError(`Analysis request failed: ${message}`);
+    } finally {
+      setProcessing(false);
     }
-
-    setResult(await response.json());
-    setAnalyzedVideoPath(videoPath);
   }
 
   async function publish() {
