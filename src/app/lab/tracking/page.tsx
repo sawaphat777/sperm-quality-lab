@@ -1,0 +1,247 @@
+"use client";
+
+import { FormEvent, useEffect, useState } from "react";
+import Link from "next/link";
+import { ArrowLeft, Film, LoaderCircle, Pause, Play } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { createBrowserSupabase } from "@/lib/supabase";
+
+type TrackingFrames = {
+  fps: number;
+  frame_count: number;
+  frames: string[];
+  metrics: {
+    tracked_sperm_count: number;
+    progressive_motility_percent: number;
+    non_progressive_motility_percent: number;
+    immotile_percent: number;
+    total_motility_percent: number;
+    average_annotated_objects?: number;
+  };
+  mode?: "prediction";
+};
+
+export default function TrackingStudioPage() {
+  const router = useRouter();
+  const supabase = createBrowserSupabase();
+  const [video, setVideo] = useState<File | null>(null);
+  const [microns, setMicrons] = useState("0.5");
+  const [minTrackLength, setMinTrackLength] = useState("8");
+  const [trackingFrames, setTrackingFrames] = useState<TrackingFrames | null>(null);
+  const [currentFrame, setCurrentFrame] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [dots, setDots] = useState(".");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    async function checkLabAccess() {
+      const {
+        data: { user }
+      } = await supabase.auth.getUser();
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
+
+      const { data } = await supabase.from("profiles").select("role").eq("id", user.id).single();
+      if (data?.role !== "lab" && data?.role !== "admin") {
+        router.replace("/home");
+      }
+    }
+
+    checkLabAccess();
+  }, [router, supabase]);
+
+  useEffect(() => {
+    if (!processing) return;
+    const timer = window.setInterval(() => {
+      setDots((current) => (current.length >= 3 ? "." : `${current}.`));
+    }, 450);
+    return () => window.clearInterval(timer);
+  }, [processing]);
+
+  useEffect(() => {
+    if (!playing || !trackingFrames?.frames.length) return;
+    const frameDelay = Math.max(40, Math.round(1000 / Math.min(trackingFrames.fps || 12, 24)));
+    const timer = window.setInterval(() => {
+      setCurrentFrame((frame) => (frame + 1) % trackingFrames.frames.length);
+    }, frameDelay);
+    return () => window.clearInterval(timer);
+  }, [playing, trackingFrames]);
+
+  async function processVideo(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!video || processing) return;
+
+    setError("");
+    setProcessing(true);
+    setPlaying(false);
+    setTrackingFrames(null);
+    setCurrentFrame(0);
+
+    const formData = new FormData();
+    formData.append("video", video);
+    formData.append("microns_per_pixel", microns);
+    formData.append("min_track_length", minTrackLength);
+    formData.append("max_frames", "240");
+
+    try {
+      const response = await fetch("/api/visualize-frames", {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({ error: "Tracking visualization failed" }));
+        setError(data.error || "Tracking visualization failed");
+        return;
+      }
+
+      const data = (await response.json()) as TrackingFrames;
+      setTrackingFrames(data);
+      setPlaying(true);
+    } catch {
+      setError("Could not reach the tracking service. Please make sure the AI service is running and try again.");
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  return (
+    <main className="lab-shell">
+      <header className="lab-header">
+        <div>
+          <div className="brand">AI Tracking Studio</div>
+          <p className="muted">Visual review of detections, movement trails, track IDs, and estimated motility class</p>
+        </div>
+        <Link className="btn secondary" href="/lab">
+          <ArrowLeft size={18} />
+          Back to Lab
+        </Link>
+      </header>
+
+      <section className="lab-main">
+        <div className="grid two">
+          <form className="lab-card form" onSubmit={processVideo}>
+            <h2>
+              <Film size={20} /> Tracking input
+            </h2>
+            <div className="field">
+              <label htmlFor="tracking-video">Microscope video</label>
+              <input
+                id="tracking-video"
+                className="input"
+                type="file"
+                accept="video/*"
+                onChange={(event) => setVideo(event.target.files?.[0] ?? null)}
+                required
+                suppressHydrationWarning
+              />
+            </div>
+            <div className="grid two">
+              <div className="field">
+                <label htmlFor="tracking-microns">Microns per pixel</label>
+                <input
+                  id="tracking-microns"
+                  className="input"
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  value={microns}
+                  onChange={(event) => setMicrons(event.target.value)}
+                  suppressHydrationWarning
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="tracking-min-length">Minimum track frames</label>
+                <input
+                  id="tracking-min-length"
+                  className="input"
+                  type="number"
+                  min="2"
+                  value={minTrackLength}
+                  onChange={(event) => setMinTrackLength(event.target.value)}
+                  suppressHydrationWarning
+                />
+              </div>
+            </div>
+            {error && <p className="error">{error}</p>}
+            <button className="btn" type="submit" disabled={!video || processing} suppressHydrationWarning>
+              {processing ? <LoaderCircle size={18} /> : <Play size={18} />}
+              {processing ? `Processing${dots}` : "Process tracking view"}
+            </button>
+          </form>
+
+          <section className="lab-card">
+            <h2>How to read the overlay</h2>
+            <div className="grid">
+              <p className="muted">Blue rings mark frame-level detections.</p>
+              <p className="muted">Colored trails show the recent movement path of each tracked sperm candidate.</p>
+              <p className="muted">Track IDs help reviewers see whether AI is following the same object across frames.</p>
+              <p className="muted">After enough frames, the overlay shows estimated class, velocity, and straightness.</p>
+            </div>
+          </section>
+        </div>
+
+        <section className="lab-card tracking-viewer" style={{ marginTop: 18 }}>
+          <div className="inline-row">
+            <h2>Tracking playback</h2>
+            {trackingFrames && (
+              <button className="btn secondary" type="button" onClick={() => setPlaying((value) => !value)}>
+                {playing ? <Pause size={18} /> : <Play size={18} />}
+                {playing ? "Pause" : "Play"}
+              </button>
+            )}
+          </div>
+          {trackingFrames ? (
+            <div className="frame-player">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                className="tracking-video"
+                src={`data:image/jpeg;base64,${trackingFrames.frames[currentFrame]}`}
+                alt="AI tracking overlay frame"
+              />
+              <div className="frame-controls">
+                <span className="muted">
+                  Frame {currentFrame + 1} / {trackingFrames.frames.length}
+                </span>
+                <input
+                  className="frame-slider"
+                  type="range"
+                  min="0"
+                  max={Math.max(0, trackingFrames.frames.length - 1)}
+                  value={currentFrame}
+                  onChange={(event) => {
+                    setPlaying(false);
+                    setCurrentFrame(Number(event.target.value));
+                  }}
+                />
+              </div>
+              <div className="grid three" style={{ marginTop: 18 }}>
+                <div className="lab-card stat">
+                  <span className="muted">Tracked</span>
+                  <strong>{trackingFrames.metrics.tracked_sperm_count}</strong>
+                </div>
+                <div className="lab-card stat">
+                  <span className="muted">Total motility</span>
+                  <strong>
+                    {`${trackingFrames.metrics.total_motility_percent.toFixed(1)}%`}
+                  </strong>
+                </div>
+                <div className="lab-card stat">
+                  <span className="muted">Immotile</span>
+                  <strong>
+                    {`${trackingFrames.metrics.immotile_percent.toFixed(1)}%`}
+                  </strong>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="tracking-empty">Upload a clip and process it to see AI tracking overlays.</div>
+          )}
+        </section>
+      </section>
+    </main>
+  );
+}
