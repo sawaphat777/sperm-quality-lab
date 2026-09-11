@@ -30,7 +30,7 @@ _ANALYSIS_JOBS: dict[str, dict[str, Any]] = {}
 _ANALYSIS_JOB_LOCK = threading.Lock()
 _TRACKING_JOBS: dict[str, dict[str, Any]] = {}
 _TRACKING_JOB_LOCK = threading.Lock()
-DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.onnx"
+DEFAULT_YOLO_MODEL_PATH = Path(__file__).resolve().parent / "models" / "sperm-detector-v1.pt"
 
 
 class AnalysisResult(BaseModel):
@@ -413,6 +413,89 @@ def classify_track(track: Track, fps: float, microns_per_pixel: float) -> tuple[
     return "immotile", velocity, straightness
 
 
+def track_heading(track: Track, window: int = 6) -> tuple[float, float] | None:
+    """Estimate the current forward direction from recent head positions."""
+    recent = track.points[-window:]
+    if len(recent) < 2:
+        return None
+
+    start_x = float(np.mean([point[1] for point in recent[: max(1, len(recent) // 2)]]))
+    start_y = float(np.mean([point[2] for point in recent[: max(1, len(recent) // 2)]]))
+    end_x = float(np.mean([point[1] for point in recent[-max(1, len(recent) // 2):]]))
+    end_y = float(np.mean([point[2] for point in recent[-max(1, len(recent) // 2):]]))
+    dx = end_x - start_x
+    dy = end_y - start_y
+    magnitude = math.hypot(dx, dy)
+    if magnitude < 1.0:
+        return None
+    return dx / magnitude, dy / magnitude
+
+
+def draw_track_annotation(
+    frame: np.ndarray,
+    track: Track,
+    color: tuple[int, int, int],
+    fps: float,
+    microns_per_pixel: float,
+    min_track_length: int,
+    show_label: bool,
+) -> None:
+    points = [(int(x), int(y)) for _, x, y in track.points[-18:]]
+    if not points:
+        return
+
+    for segment_index, (point_a, point_b) in enumerate(zip(points, points[1:])):
+        age_ratio = (segment_index + 1) / max(len(points) - 1, 1)
+        faded_color = tuple(int(channel * (0.35 + 0.65 * age_ratio)) for channel in color)
+        cv2.line(frame, point_a, point_b, faded_color, 1 if age_ratio < 0.65 else 2, cv2.LINE_AA)
+
+    head = points[-1]
+    heading = track_heading(track)
+    if heading is None:
+        cv2.circle(frame, head, 7, color, 2, cv2.LINE_AA)
+    else:
+        direction_x, direction_y = heading
+        angle = math.degrees(math.atan2(direction_y, direction_x))
+        tail_axis_end = (
+            int(round(head[0] - direction_x * 18)),
+            int(round(head[1] - direction_y * 18)),
+        )
+        direction_end = (
+            int(round(head[0] + direction_x * 25)),
+            int(round(head[1] + direction_y * 25)),
+        )
+        cv2.line(frame, tail_axis_end, head, (235, 235, 235), 1, cv2.LINE_AA)
+        cv2.ellipse(frame, head, (8, 5), angle, 0, 360, color, 2, cv2.LINE_AA)
+        cv2.arrowedLine(frame, head, direction_end, color, 2, cv2.LINE_AA, tipLength=0.32)
+
+    if not show_label:
+        return
+
+    label_y = max(head[1] - 10, 16)
+    cv2.putText(
+        frame,
+        f"ID {track.track_id}",
+        (head[0] + 9, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        color,
+        1,
+        cv2.LINE_AA,
+    )
+    if len(track.points) >= min_track_length:
+        category, velocity, straightness = classify_track(track, fps, microns_per_pixel)
+        cv2.putText(
+            frame,
+            f"{category} {velocity:.1f}um/s STR {straightness:.2f}",
+            (head[0] + 9, head[1] + 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def analyze_video(path: Path, microns_per_pixel: float, min_track_length: int) -> AnalysisResult:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
@@ -584,37 +667,19 @@ def draw_tracking_overlay(
             [track for track in tracks if len(track.points) >= 3],
             key=lambda item: len(item.points),
             reverse=True,
-        )[:45]
+        )[:70]
 
         for label_count, track in enumerate(display_tracks):
             color = colors[track.track_id % len(colors)]
-            points = [(int(x), int(y)) for _, x, y in track.points[-12:]]
-            for p1, p2 in zip(points, points[1:]):
-                cv2.line(frame, p1, p2, color, 2)
-            if points:
-                cv2.circle(frame, points[-1], 6, color, -1)
-                if label_count < 8:
-                    cv2.putText(
-                        frame,
-                        f"ID {track.track_id}",
-                        (points[-1][0] + 8, points[-1][1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        color,
-                        1,
-                    )
-
-                if len(track.points) >= min_track_length and label_count < 8:
-                    category, velocity, straightness = classify_track(track, fps, effective_mpp)
-                    cv2.putText(
-                        frame,
-                        f"{category} {velocity:.1f}um/s STR {straightness:.2f}",
-                        (points[-1][0] + 8, points[-1][1] + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.38,
-                        color,
-                        1,
-                    )
+            draw_track_annotation(
+                frame,
+                track,
+                color,
+                fps,
+                effective_mpp,
+                min_track_length,
+                show_label=label_count < 10,
+            )
 
         writer.write(frame)
         frame_index += 1
@@ -696,7 +761,7 @@ def collect_tracking_frames(
         legend_y = height - 20
         cv2.putText(
             frame,
-            "Blue rings=detections | Colored trails=tracked objects | Labels=motility estimate",
+            "Ring=head | Rear line=estimated tail axis | Arrow=motion direction | Trail=history",
             (18, legend_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -711,39 +776,19 @@ def collect_tracking_frames(
             [track for track in tracks if len(track.points) >= 3],
             key=lambda item: len(item.points),
             reverse=True,
-        )[:45]
+        )[:70]
 
         for label_count, track in enumerate(display_tracks):
             color = colors[track.track_id % len(colors)]
-            points = [(int(x), int(y)) for _, x, y in track.points[-12:]]
-            for p1, p2 in zip(points, points[1:]):
-                cv2.line(frame, p1, p2, color, 2)
-            if not points:
-                continue
-
-            cv2.circle(frame, points[-1], 6, color, -1)
-            if label_count < 8:
-                cv2.putText(
-                    frame,
-                    f"ID {track.track_id}",
-                    (points[-1][0] + 8, max(points[-1][1] - 8, 16)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    color,
-                    1,
-                )
-
-            if len(track.points) >= min_track_length and label_count < 8:
-                category, velocity, straightness = classify_track(track, fps, effective_mpp)
-                cv2.putText(
-                    frame,
-                    f"{category} {velocity:.1f}um/s STR {straightness:.2f}",
-                    (points[-1][0] + 8, points[-1][1] + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    color,
-                    1,
-                )
+            draw_track_annotation(
+                frame,
+                track,
+                color,
+                fps,
+                effective_mpp,
+                min_track_length,
+                show_label=label_count < 10,
+            )
 
         ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
         if ok:

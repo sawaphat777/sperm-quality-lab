@@ -228,8 +228,9 @@ export default function TrackingStudioPage() {
           <section className="lab-card">
             <h2>How to read the overlay</h2>
             <div className="grid">
-              <p className="muted">Blue rings mark frame-level detections.</p>
-              <p className="muted">Colored trails show the recent movement path of each tracked sperm candidate.</p>
+              <p className="muted">Head rings mark detections from the original PyTorch model.</p>
+              <p className="muted">Rear axes estimate tail orientation from recent head movement.</p>
+              <p className="muted">Arrows show smoothed movement direction and colored trails show recent paths.</p>
               <p className="muted">Track IDs help reviewers see whether AI is following the same object across frames.</p>
               <p className="muted">After enough frames, the overlay shows estimated class, velocity, and straightness.</p>
             </div>
