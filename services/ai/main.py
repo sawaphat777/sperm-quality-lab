@@ -326,7 +326,7 @@ def detect_cells_onnx(
     return centers
 
 
-def detect_cells_yolo(frame: np.ndarray, confidence: float = 0.25) -> list[tuple[float, float]]:
+def detect_cells_yolo(frame: np.ndarray, confidence: float = 0.18) -> list[tuple[float, float]]:
     model = get_yolo_model()
     if model is None:
         return []
@@ -351,15 +351,10 @@ def detect_cells_yolo(frame: np.ndarray, confidence: float = 0.25) -> list[tuple
 
 
 def detect_cells_ai(frame: np.ndarray) -> list[tuple[float, float]]:
-    if get_yolo_model() is None:
-        return detect_cells(frame)
-
-    detections = detect_cells_yolo(frame, confidence=0.25)
-    if len(detections) > 120:
-        detections = detect_cells_yolo(frame, confidence=0.45)
-    if len(detections) > 120:
-        detections = detect_cells_yolo(frame, confidence=0.60)
-    return detections[:120]
+    yolo_detections = detect_cells_yolo(frame)
+    if yolo_detections:
+        return yolo_detections
+    return detect_cells(frame)
 
 
 def update_tracks(
@@ -688,10 +683,9 @@ def collect_tracking_frames(
         cv2.addWeighted(overlay, 0.58, frame, 0.42, 0, frame)
 
         cv2.putText(frame, "AI Tracking View", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2)
-        confirmed_tracks = [track for track in tracks if len(track.points) >= min_track_length]
         cv2.putText(
             frame,
-            f"Frame {frame_index + 1} | Confirmed tracks {len(confirmed_tracks)} | Candidates {len(detections)}",
+            f"Frame {frame_index + 1} | Active tracks {len(tracks)} | Detections {len(detections)} | Link <= {max_distance_px:.0f}px",
             (18, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.56,
@@ -702,7 +696,7 @@ def collect_tracking_frames(
         legend_y = height - 20
         cv2.putText(
             frame,
-            "Colored trails=confirmed tracks | Labels=motility estimate",
+            "Blue rings=detections | Colored trails=tracked objects | Labels=motility estimate",
             (18, legend_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -710,11 +704,14 @@ def collect_tracking_frames(
             1,
         )
 
+        for x, y in detections[:140]:
+            cv2.circle(frame, (int(x), int(y)), 8, (80, 160, 255), 1)
+
         display_tracks = sorted(
-            confirmed_tracks,
+            [track for track in tracks if len(track.points) >= 3],
             key=lambda item: len(item.points),
             reverse=True,
-        )[:30]
+        )[:45]
 
         for label_count, track in enumerate(display_tracks):
             color = colors[track.track_id % len(colors)]

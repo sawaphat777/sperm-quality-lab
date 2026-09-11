@@ -228,8 +228,8 @@ export default function TrackingStudioPage() {
           <section className="lab-card">
             <h2>How to read the overlay</h2>
             <div className="grid">
-              <p className="muted">Only detections confirmed across multiple frames are displayed.</p>
-              <p className="muted">Colored trails show the recent movement path of each confirmed sperm track.</p>
+              <p className="muted">Blue rings mark frame-level detections.</p>
+              <p className="muted">Colored trails show the recent movement path of each tracked sperm candidate.</p>
               <p className="muted">Track IDs help reviewers see whether AI is following the same object across frames.</p>
               <p className="muted">After enough frames, the overlay shows estimated class, velocity, and straightness.</p>
             </div>
