@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Film, LoaderCircle, Pause, Play } from "lucide-react";
 import { useRouter } from "next/navigation";
@@ -30,9 +30,19 @@ export default function TrackingStudioPage() {
   const [trackingFrames, setTrackingFrames] = useState<TrackingFrames | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [frameUrls, setFrameUrls] = useState<string[]>([]);
+  const [loadedFrameCount, setLoadedFrameCount] = useState(0);
+  const [loadingFrames, setLoadingFrames] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [dots, setDots] = useState(".");
   const [error, setError] = useState("");
+  const frameUrlsRef = useRef<string[]>([]);
+
+  function releaseFrameUrls() {
+    for (const url of frameUrlsRef.current) URL.revokeObjectURL(url);
+    frameUrlsRef.current = [];
+    setFrameUrls([]);
+  }
 
   useEffect(() => {
     async function checkLabAccess() {
@@ -53,6 +63,10 @@ export default function TrackingStudioPage() {
     checkLabAccess();
   }, [router, supabase]);
 
+  useEffect(() => () => {
+    for (const url of frameUrlsRef.current) URL.revokeObjectURL(url);
+  }, []);
+
   useEffect(() => {
     if (!processing) return;
     const timer = window.setInterval(() => {
@@ -62,13 +76,52 @@ export default function TrackingStudioPage() {
   }, [processing]);
 
   useEffect(() => {
-    if (!playing || !trackingFrames?.frame_count) return;
+    if (!playing || !trackingFrames?.frame_count || frameUrls.length !== trackingFrames.frame_count) return;
     const frameDelay = Math.max(40, Math.round(1000 / Math.min(trackingFrames.fps || 12, 24)));
     const timer = window.setInterval(() => {
       setCurrentFrame((frame) => (frame + 1) % trackingFrames.frame_count);
     }, frameDelay);
     return () => window.clearInterval(timer);
-  }, [playing, trackingFrames]);
+  }, [playing, trackingFrames, frameUrls.length]);
+
+  async function loadPlaybackFrames(jobId: string, frameCount: number) {
+    setLoadingFrames(true);
+    setLoadedFrameCount(0);
+    const urls = new Array<string>(frameCount);
+    let nextFrame = 0;
+
+    async function loadWorker() {
+      while (nextFrame < frameCount) {
+        const frameIndex = nextFrame;
+        nextFrame += 1;
+        let response: Response | null = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          response = await fetch(
+            `/api/tracking-jobs/${encodeURIComponent(jobId)}/frames/${frameIndex}`,
+            { cache: "force-cache" }
+          );
+          if (response.ok) break;
+        }
+        if (!response?.ok) throw new Error(`Could not load playback frame ${frameIndex + 1}`);
+        urls[frameIndex] = URL.createObjectURL(await response.blob());
+        setLoadedFrameCount((count) => count + 1);
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(6, frameCount) }, () => loadWorker()));
+      frameUrlsRef.current = urls;
+      setFrameUrls(urls);
+      setCurrentFrame(0);
+      setPlaying(true);
+    } catch (frameError) {
+      for (const url of urls) if (url) URL.revokeObjectURL(url);
+      const message = frameError instanceof Error ? frameError.message : "Unknown playback error";
+      setError(`Tracking completed, but playback preparation failed: ${message}`);
+    } finally {
+      setLoadingFrames(false);
+    }
+  }
 
   async function processVideo(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -77,6 +130,7 @@ export default function TrackingStudioPage() {
     setError("");
     setProcessing(true);
     setPlaying(false);
+    releaseFrameUrls();
     setTrackingFrames(null);
     setCurrentFrame(0);
 
@@ -140,14 +194,15 @@ export default function TrackingStudioPage() {
           return;
         }
         if (statusData.status === "completed") {
-          setTrackingFrames({
+          const completedTracking: TrackingFrames = {
             jobId: startData.jobId,
             fps: statusData.fps,
             frame_count: statusData.frame_count,
             metrics: statusData.metrics,
             mode: statusData.mode
-          });
-          setPlaying(true);
+          };
+          setTrackingFrames(completedTracking);
+          await loadPlaybackFrames(completedTracking.jobId, completedTracking.frame_count);
           return;
         }
       }
@@ -240,19 +295,23 @@ export default function TrackingStudioPage() {
         <section className="lab-card tracking-viewer" style={{ marginTop: 18 }}>
           <div className="inline-row">
             <h2>Tracking playback</h2>
-            {trackingFrames && (
+            {trackingFrames && !loadingFrames && frameUrls.length === trackingFrames.frame_count && (
               <button className="btn secondary" type="button" onClick={() => setPlaying((value) => !value)}>
                 {playing ? <Pause size={18} /> : <Play size={18} />}
                 {playing ? "Pause" : "Play"}
               </button>
             )}
           </div>
-          {trackingFrames ? (
+          {trackingFrames && loadingFrames ? (
+            <div className="tracking-empty">
+              Preparing smooth playback {loadedFrameCount} / {trackingFrames.frame_count}
+            </div>
+          ) : trackingFrames && frameUrls.length === trackingFrames.frame_count ? (
             <div className="frame-player">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 className="tracking-video"
-                src={`/api/tracking-jobs/${encodeURIComponent(trackingFrames.jobId)}/frames/${currentFrame}`}
+                src={frameUrls[currentFrame]}
                 alt="AI tracking overlay frame"
               />
               <div className="frame-controls">
