@@ -94,22 +94,33 @@ export default function TrackingStudioPage() {
       while (nextFrame < frameCount) {
         const frameIndex = nextFrame;
         nextFrame += 1;
-        let response: Response | null = null;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          response = await fetch(
-            `/api/tracking-jobs/${encodeURIComponent(jobId)}/frames/${frameIndex}`,
-            { cache: "force-cache" }
-          );
-          if (response.ok) break;
+        let frameBlob: Blob | null = null;
+        let lastError = "Network request failed";
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          try {
+            const response = await fetch(
+              `/api/tracking-jobs/${encodeURIComponent(jobId)}/frames/${frameIndex}`,
+              { cache: "no-store" }
+            );
+            if (response.ok) {
+              frameBlob = await response.blob();
+              break;
+            }
+            const body = await response.json().catch(() => null);
+            lastError = body?.error || `Server returned ${response.status}`;
+          } catch (requestError) {
+            lastError = requestError instanceof Error ? requestError.message : "Network request failed";
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 400 * (attempt + 1)));
         }
-        if (!response?.ok) throw new Error(`Could not load playback frame ${frameIndex + 1}`);
-        urls[frameIndex] = URL.createObjectURL(await response.blob());
+        if (!frameBlob) throw new Error(`Frame ${frameIndex + 1}: ${lastError}`);
+        urls[frameIndex] = URL.createObjectURL(frameBlob);
         setLoadedFrameCount((count) => count + 1);
       }
     }
 
     try {
-      await Promise.all(Array.from({ length: Math.min(6, frameCount) }, () => loadWorker()));
+      await Promise.all(Array.from({ length: Math.min(2, frameCount) }, () => loadWorker()));
       frameUrlsRef.current = urls;
       setFrameUrls(urls);
       setCurrentFrame(0);
